@@ -3,29 +3,40 @@
 """
 Video Cutter – Qt + VLC (single-window) + PNG placeholder + WebView banner (LEFT)
 + Persistent Settings (NVIDIA hw decode, H.265 export, remember window geometry)
++ MULTI-SEGMENTS (grid) with save/load/export
++ Click-on-row: restore segment marks on the slider (and optional seek/play)
 
 Layout:
 - LEFT: Web banner (http://gidway.net/banner) – pełna wysokość, stała szerokość
 - RIGHT: Video (osadzone) + Slider (full width) + Controls + Checkboxes
+         + Segments table (IN/OUT/Dur/Title) + grid actions
 
 Funkcje:
 - Placeholder PNG, gdy brak/błąd wideo
-- IN/OUT, szybki eksport FFmpeg:
-    * -c copy (domyślnie)
-    * H.265 (libx265 lub hevc_nvenc, gdy zaznaczone)
-    * opcjonalny decode przez -hwaccel cuda
+- Ustawianie IN/OUT i dodawanie wielu fragmentów do siatki
+- Klik w segment w tabeli → markery IN/OUT wracają na suwak; podwójny klik → odtwarzaj od startu
+- Eksport: pojedynczy (z IN/OUT lub zaznaczonego w siatce) albo zbiorczy (cała siatka)
+- Zapis/Odczyt siatki do pliku JSON (z metadanymi: źródłowy czas trwania)
+- Opcja „Scale grid to current video” – przeskaluj czasy z siatki do długości aktualnego filmu
+- Szybki eksport FFmpeg (-c copy) lub H.265 (libx265/hevc_nvenc), opcjonalnie -hwaccel cuda
 - Pasek postępu przy eksporcie, auto-zamykanie
-- Skróty: Space, I, O, E, Ctrl+O, Ctrl+Q; ←/→ klatka; Shift+←/→ mikroprzesunięcie; Ctrl+C zamyka
-- Ustawienia (QSettings): NVIDIA decode, H.265 export, remember geometry
+- Skróty: Space, I, O, A(dodaj segment), Del(usuń segment),
+          E (eksport pojedynczy), Ctrl+E (eksport siatki),
+          Ctrl+S (zapis siatki), Ctrl+L (wczytaj siatkę),
+          Ctrl+O (otwórz wideo), Ctrl+Q (zamknij),
+          ←/→ (klatka), Shift+←/→ (nudge)
 - Klik w obszar filmu = Play/Pause
 """
 
 import os
 import re
 import sys
+import json
 import signal
 import mimetypes
+from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 # Wycisz libva (logi); HW decode kontrolujemy w FFmpeg
 os.environ.setdefault("LIBVA_MESSAGING_LEVEL", "0")
@@ -75,6 +86,7 @@ BANNER_WIDTH = 180  # szerokość lewej kolumny z banerem
 # Placeholder PNG (możesz nadpisać ścieżką w env VIDCUT_PLACEHOLDER)
 PLACEHOLDER_PNG = os.getenv("VIDCUT_PLACEHOLDER", str(Path(__file__).with_name("logo.png")))
 
+
 # ----------------------------- Helpers -----------------------------
 def ms_to_hhmmss_ms(ms: int | None) -> str:
     if ms is None or ms < 0:
@@ -85,7 +97,32 @@ def ms_to_hhmmss_ms(ms: int | None) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{msec:03d}"
 
 
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+@dataclass
+class Segment:
+    start_ms: int
+    end_ms: int
+    title: str = ""
+
+    def duration_ms(self) -> int:
+        return max(0, self.end_ms - self.start_ms)
+
+    def as_row(self) -> Tuple[str, str, str, str]:
+        dur = self.duration_ms()
+        return (
+            ms_to_hhmmss_ms(self.start_ms),
+            ms_to_hhmmss_ms(self.end_ms),
+            ms_to_hhmmss_ms(dur),
+            self.title or "",
+        )
+
+
 class MarkingSlider(QtWidgets.QSlider):
+    """Slider z pojedynczym aktualnym zaznaczeniem IN/OUT (do tworzenia segmentów).
+       (Segmenty zapisane w tabeli nie są tu malowane – trzymamy UI prosto i szybko.)"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setOrientation(Qt.Horizontal)
@@ -139,10 +176,7 @@ class MarkingSlider(QtWidgets.QSlider):
 
 
 class BannerWidget(QtWidgets.QFrame):
-    """
-    Kolumna banera po lewej: jeśli WebEngine jest dostępny → QWebEngineView (render strony).
-    Jeśli nie → QLabel (opcjonalnie obraz z URL/lokalnej ścieżki), klik/Link otwiera stronę w przeglądarce.
-    """
+    """Kolumna banera po lewej: QWebEngineView (jeśli dostępne) lub QLabel (fallback)."""
     def __init__(self, url: str = "http://gidway.net/banner",
                  image_url: str | None = None, parent=None):
         super().__init__(parent)
@@ -196,7 +230,7 @@ class BannerWidget(QtWidgets.QFrame):
                 pass
 
     def mousePressEvent(self, ev: QtGui.QMouseEvent):
-        if self.view is None and self._url:
+        if getattr(self, "view", None) is None and self._url:
             QDesktopServices.openUrl(QUrl(self._url))
         super().mousePressEvent(ev)
 
@@ -232,7 +266,7 @@ class VideoCutter(QtWidgets.QMainWindow):
         else:
             self.resize(1200, 800)
 
-        # VLC core (stabilne wyjście X11, HW decode off by default)
+        # VLC core
         self.vlc_instance = vlc.Instance([
             "--quiet",
             "--no-video-title-show",
@@ -296,7 +330,7 @@ class VideoCutter(QtWidgets.QMainWindow):
         self.slider.sliderReleased.connect(self._slider_released)
         self.slider.sliderMoved.connect(lambda v: self._update_time_label(v, self._duration_ms))
 
-        # PRZYCISKI
+        # PRZYCISKI (transport + znaczniki)
         ctr = QtWidgets.QHBoxLayout()
         hbox_right.addLayout(ctr)
 
@@ -305,10 +339,14 @@ class VideoCutter(QtWidgets.QMainWindow):
 
         self.btn_set_in = QtWidgets.QPushButton("IN (I)"); self.btn_set_in.clicked.connect(self.set_in)
         self.btn_set_out = QtWidgets.QPushButton("OUT (O)"); self.btn_set_out.clicked.connect(self.set_out)
-        self.btn_clear = QtWidgets.QPushButton("Clear"); self.btn_clear.clicked.connect(self.clear_marks)
-        for b in (self.btn_set_in, self.btn_set_out, self.btn_clear): ctr.addWidget(b)
+        self.btn_add_seg = QtWidgets.QPushButton("Add segment (A)"); self.btn_add_seg.clicked.connect(self.add_segment_from_marks)
+        self.btn_clear_marks = QtWidgets.QPushButton("Clear IN/OUT"); self.btn_clear_marks.clicked.connect(self.clear_marks)
+        for b in (self.btn_set_in, self.btn_set_out, self.btn_add_seg, self.btn_clear_marks): ctr.addWidget(b)
 
-        self.btn_export = QtWidgets.QPushButton("Export (E)"); self.btn_export.clicked.connect(self.export_clip); self.btn_export.setEnabled(False); ctr.addWidget(self.btn_export)
+        self.btn_export_single = QtWidgets.QPushButton("Export current (E)")
+        self.btn_export_single.clicked.connect(self.export_current_or_selected)
+        ctr.addWidget(self.btn_export_single)
+
         self.btn_close = QtWidgets.QPushButton("Close"); self.btn_close.clicked.connect(self.request_close); ctr.addWidget(self.btn_close)
 
         # OPCJE / CHECKBOXY
@@ -327,13 +365,74 @@ class VideoCutter(QtWidgets.QMainWindow):
         self.chk_remember_geometry.setChecked(self._remember_geometry)
         opts.addWidget(self.chk_remember_geometry)
 
+        self.chk_scale_grid = QtWidgets.QCheckBox("Scale grid to current video")
+        self.chk_scale_grid.setChecked(self.settings.value("scale_grid", False, type=bool))
+        opts.addWidget(self.chk_scale_grid)
+
         opts.addStretch(1)
+
+        # --- SEGMENTS TABLE + ACTIONS ---
+        seg_box = QtWidgets.QVBoxLayout()
+        hbox_right.addLayout(seg_box)
+
+        self.table = QtWidgets.QTableWidget(0, 4, self)
+        self.table.setHorizontalHeaderLabels(["IN", "OUT", "DURATION", "TITLE"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        our_select_mode = QtWidgets.QAbstractItemView.SingleSelection
+        self.table.setSelectionMode(our_select_mode)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
+        seg_box.addWidget(self.table)
+
+        # >>> NEW: przywracanie ram segmentu po wyborze / podwójnym kliknięciu
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
+        # <<< NEW
+
+        seg_actions = QtWidgets.QHBoxLayout()
+        seg_box.addLayout(seg_actions)
+
+        self.btn_remove_seg = QtWidgets.QPushButton("Remove (Del)")
+        self.btn_remove_seg.clicked.connect(self.remove_selected_segment)
+        seg_actions.addWidget(self.btn_remove_seg)
+
+        self.btn_clear_grid = QtWidgets.QPushButton("Clear grid")
+        self.btn_clear_grid.clicked.connect(self.clear_grid)
+        seg_actions.addWidget(self.btn_clear_grid)
+
+        self.btn_export_selected = QtWidgets.QPushButton("Export selected")
+        self.btn_export_selected.clicked.connect(lambda: self.export_segments(selected_only=True))
+        seg_actions.addWidget(self.btn_export_selected)
+
+        self.btn_export_all = QtWidgets.QPushButton("Export ALL (Ctrl+E)")
+        self.btn_export_all.clicked.connect(lambda: self.export_segments(selected_only=False))
+        seg_actions.addWidget(self.btn_export_all)
+
+        self.btn_save_grid = QtWidgets.QPushButton("Save grid (Ctrl+S)")
+        self.btn_save_grid.clicked.connect(self.save_grid_to_json)
+        seg_actions.addWidget(self.btn_save_grid)
+
+        self.btn_load_grid = QtWidgets.QPushButton("Load grid (Ctrl+L)")
+        self.btn_load_grid.clicked.connect(self.load_grid_from_json)
+        seg_actions.addWidget(self.btn_load_grid)
+
+        seg_actions.addStretch(1)
 
         # Skróty
         QShortcutCls(QKeySequence("Space"), self, self.toggle)
         QShortcutCls(QKeySequence("I"), self, self.set_in)
         QShortcutCls(QKeySequence("O"), self, self.set_out)
-        QShortcutCls(QKeySequence("E"), self, self.export_clip)
+        QShortcutCls(QKeySequence("A"), self, self.add_segment_from_marks)
+        QShortcutCls(QKeySequence("Delete"), self, self.remove_selected_segment)
+
+        QShortcutCls(QKeySequence("E"), self, self.export_current_or_selected)
+        QShortcutCls(QKeySequence("Ctrl+E"), self, lambda: self.export_segments(False))
+        QShortcutCls(QKeySequence("Ctrl+S"), self, self.save_grid_to_json)
+        QShortcutCls(QKeySequence("Ctrl+L"), self, self.load_grid_from_json)
+
         QShortcutCls(QKeySequence("Ctrl+O"), self, self.open_file_dialog)
         QShortcutCls(QKeySequence("Ctrl+Q"), self, self.request_close)
         QShortcutCls(QKeySequence(Qt.Key_Right), self, self.step_frame_forward)
@@ -345,6 +444,8 @@ class VideoCutter(QtWidgets.QMainWindow):
         bar = self.menuBar()
         filem = bar.addMenu("&File")
         act_open = QAction("Open… (Ctrl+O)", self); act_open.triggered.connect(self.open_file_dialog); filem.addAction(act_open)
+        act_saveg = QAction("Save grid (Ctrl+S)", self); act_saveg.triggered.connect(self.save_grid_to_json); filem.addAction(act_saveg)
+        act_loadg = QAction("Load grid (Ctrl+L)", self); act_loadg.triggered.connect(self.load_grid_from_json); filem.addAction(act_loadg)
         act_quit = QAction("Quit", self); act_quit.triggered.connect(self.close); filem.addAction(act_quit)
         helpm = bar.addMenu("&Help")
         about = QAction("About", self); about.triggered.connect(self._show_about); helpm.addAction(about)
@@ -361,6 +462,10 @@ class VideoCutter(QtWidgets.QMainWindow):
         self._frame_ms = 40
         self._have_next_frame = hasattr(self.mplayer, "next_frame")
 
+        # grid (pamięć wewnętrzna)
+        self._segments: List[Segment] = []
+        self._grid_source_duration: int | None = None  # do skalowania siatki po wczytaniu
+
         if initial_path:
             self.open_path(initial_path)
 
@@ -374,7 +479,9 @@ class VideoCutter(QtWidgets.QMainWindow):
             f"<h1>Gidway</h1>AppName: <b>VideoCutter</b><br />"
             f"AppVersion: PySide{PYSIDE_MAJOR} + VLC + FFmpeg<br />"
             "WebPage: <a href=\"https://gidway.net/?ref=videocutter\">www.gidway.net</a>"
-            "<br /><br />Hotkeys: Space (Play/Pause), I (IN), O (OUT), E (Export), ←/→ frame"
+            "<br /><br />Hotkeys: Space (Play/Pause), I (IN), O (OUT), A (Add seg), "
+            "E (Export current), Ctrl+E (Export ALL), Ctrl+S (Save grid), Ctrl+L (Load grid), "
+            "←/→ (frame)"
         )
 
     def request_close(self):
@@ -448,7 +555,7 @@ class VideoCutter(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(200, self.mplayer.pause)
         self.statusBar().showMessage(f"Loaded: {p.name}")
         self.slider.setEnabled(True)
-        self.btn_export.setEnabled(True)
+        self.btn_export_single.setEnabled(True)
         self.clear_marks()
 
     # ---- Playback ----
@@ -525,7 +632,7 @@ class VideoCutter(QtWidgets.QMainWindow):
             dur = int(self.mplayer.get_length() or 0)
             new_t = cur + int(delta_ms)
             if dur > 0:
-                new_t = max(0, min(dur - 1, new_t))
+                new_t = clamp(new_t, 0, dur - 1)
             else:
                 new_t = max(0, new_t)
             try: self.mplayer.pause()
@@ -545,7 +652,7 @@ class VideoCutter(QtWidgets.QMainWindow):
     def step_frame_backward(self):
         self.nudge_ms(-self._frame_ms, force_redraw=True)
 
-    # ---- Marking ----
+    # ---- Marks → current selection ----
     def current_ms(self) -> int:
         t = self.mplayer.get_time()
         return int(t if t and t > 0 else 0)
@@ -573,6 +680,151 @@ class VideoCutter(QtWidgets.QMainWindow):
         self.slider.out_ms = None
         self.slider.update()
 
+    # ---- NEW: pokaż segment na suwaku (+ ewentualny seek/play) ----
+    def _show_segment_on_slider(self, seg: Segment, seek: bool = True, pause: bool = True):
+        """Ustaw markery IN/OUT na suwaku wg segmentu i (opcjonalnie) przeskocz do startu."""
+        if seg is None:
+            return
+        self.slider.in_ms = int(seg.start_ms)
+        self.slider.out_ms = int(seg.end_ms)
+        self.slider.update()
+
+        if seek and self._loaded_path is not None:
+            try:
+                self.mplayer.pause()
+            except Exception:
+                pass
+            self.mplayer.set_time(int(seg.start_ms))
+            if pause:
+                self._force_redraw(self._frame_ms // 2)
+            else:
+                self.mplayer.play()
+
+        # zaktualizuj label czasu i pozycję suwaka
+        if seek:
+            self.slider.setValue(int(seg.start_ms))
+            self._update_time_label(int(seg.start_ms), self._duration_ms)
+
+    # ---- Segments grid ----
+    def add_segment_from_marks(self):
+        if self._duration_ms <= 0:
+            self.statusBar().showMessage("Load a video first.", 2500)
+            return
+        if self.slider.in_ms is None or self.slider.out_ms is None or self.slider.out_ms <= self.slider.in_ms:
+            self.statusBar().showMessage("Set valid IN/OUT first.", 2500)
+            return
+
+        seg = Segment(start_ms=int(self.slider.in_ms), end_ms=int(self.slider.out_ms), title="")
+        self._segments.append(seg)
+        self._append_segment_row(seg)
+
+        # NEW: automatycznie zaznacz dopisany segment i przywróć jego ramy
+        r = self.table.rowCount() - 1
+        if r >= 0:
+            self.table.selectRow(r)
+            self._show_segment_on_slider(seg, seek=True, pause=True)
+
+        # auto-clear marks dla szybkiego znakowania
+        self.clear_marks()
+
+    def _append_segment_row(self, seg: Segment):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        in_item  = QtWidgets.QTableWidgetItem(seg.as_row()[0]); in_item.setFlags(in_item.flags() & ~Qt.ItemIsEditable)
+        out_item = QtWidgets.QTableWidgetItem(seg.as_row()[1]); out_item.setFlags(out_item.flags() & ~Qt.ItemIsEditable)
+        dur_item = QtWidgets.QTableWidgetItem(seg.as_row()[2]); dur_item.setFlags(dur_item.flags() & ~Qt.ItemIsEditable)
+        ttl_item = QtWidgets.QTableWidgetItem(seg.as_row()[3])
+
+        self.table.setItem(r, 0, in_item)
+        self.table.setItem(r, 1, out_item)
+        self.table.setItem(r, 2, dur_item)
+        self.table.setItem(r, 3, ttl_item)
+
+    def _refresh_table(self):
+        self.table.setRowCount(0)
+        for s in self._segments:
+            self._append_segment_row(s)
+
+    def _selected_row_index(self) -> Optional[int]:
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            return rows[0].row()
+        return None
+
+    # ---- NEW: reakcje tabeli na wybór / podwójny klik ----
+    def _on_table_selection_changed(self):
+        idx = self._selected_row_index()
+        if idx is None:
+            return
+        if 0 <= idx < len(self._segments):
+            seg = self._segments[idx]
+            # pokaż markery na suwaku, przeskocz i zostaw spauzowane
+            self._show_segment_on_slider(seg, seek=True, pause=True)
+
+    def _on_table_cell_double_clicked(self, row: int, col: int):
+        if 0 <= row < len(self._segments):
+            seg = self._segments[row]
+            # podwójny klik – odtwórz od początku segmentu
+            self._show_segment_on_slider(seg, seek=True, pause=False)
+
+    def remove_selected_segment(self):
+        idx = self._selected_row_index()
+        if idx is None:
+            return
+        if 0 <= idx < len(self._segments):
+            del self._segments[idx]
+            self.table.removeRow(idx)
+
+    def clear_grid(self):
+        self._segments.clear()
+        self.table.setRowCount(0)
+
+    # ---- Save/Load grid (JSON) ----
+    def save_grid_to_json(self):
+        if not self._segments:
+            self.statusBar().showMessage("Grid is empty.", 2500)
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save grid as…", str(self._loaded_path.parent if self._loaded_path else Path.home() / "segments.json"),
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        data = {
+            "source_file": str(self._loaded_path) if self._loaded_path else None,
+            "source_duration_ms": int(self._duration_ms),
+            "segments": [asdict(s) for s in self._segments],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.statusBar().showMessage(f"Grid saved: {path}", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to save grid: {e}", 4000)
+
+    def load_grid_from_json(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load grid…", str(self._loaded_path.parent if self._loaded_path else Path.home()),
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            segs = []
+            for d in data.get("segments", []):
+                s = Segment(start_ms=int(d["start_ms"]), end_ms=int(d["end_ms"]), title=str(d.get("title", "")))
+                segs.append(s)
+
+            self._segments = segs
+            self._refresh_table()
+            self._grid_source_duration = int(data.get("source_duration_ms", 0))
+            self.statusBar().showMessage(f"Grid loaded: {path}", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to load grid: {e}", 4000)
+
+    # ---- Error / cleanup ----
     def _show_error(self, msg: str):
         self.statusBar().showMessage(msg, 5000)
         try:
@@ -585,41 +837,13 @@ class VideoCutter(QtWidgets.QMainWindow):
         except Exception:
             pass
         self.slider.setEnabled(False)
-        self.btn_export.setEnabled(False)
-        self.slider.in_ms = None
-        self.slider.out_ms = None
-        self.slider.update()
+        self.btn_export_single.setEnabled(False)
+        self.clear_marks()
         self._show_placeholder()
         self._loaded_path = None
 
-    # ---- Export (Save dialog only, with options) ----
-    def export_clip(self):
-        if self._loaded_path is None:
-            return
-        if self.slider.in_ms is None or self.slider.out_ms is None or self.slider.out_ms <= self.slider.in_ms:
-            self.statusBar().showMessage("Set IN/OUT first", 2500)
-            return
-
-        # zapamiętaj ustawienia checkboxów
-        self.settings.setValue("use_nvdec", bool(self.chk_nvdec.isChecked()))
-        self.settings.setValue("use_h265", bool(self.chk_h265.isChecked()))
-        self.settings.setValue("remember_geometry", bool(self.chk_remember_geometry.isChecked()))
-        self.settings.sync()
-
-        base = self._loaded_path.stem
-        suffix = ".mp4"
-        default = f"{base}_{ms_to_hhmmss_ms(self.slider.in_ms).replace(':','-').replace('.', '-')}_{ms_to_hhmmss_ms(self.slider.out_ms).replace(':','-').replace('.', '-')}{suffix}"
-        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Clip As…", str(self._loaded_path.parent / default),
-            "MP4 Video (*.mp4);;All Files (*)"
-        )
-        if not out_path:
-            return
-
-        in_ts = f"{self.slider.in_ms/1000.0:.3f}"
-        duration = f"{(self.slider.out_ms - self.slider.in_ms)/1000.0:.3f}"
-
-        # Budowa komendy ffmpeg zależnie od opcji
+    # ---- Export helpers ----
+    def _ffmpeg_cmd(self, in_ts: float, duration_s: float, input_path: str, out_path: str) -> list:
         use_cuda = bool(self.chk_nvdec.isChecked())
         use_h265 = bool(self.chk_h265.isChecked())
 
@@ -627,10 +851,9 @@ class VideoCutter(QtWidgets.QMainWindow):
         if use_cuda:
             cmd += ["-hwaccel", "cuda"]
 
-        cmd += ["-ss", in_ts, "-t", duration, "-i", str(self._loaded_path)]
+        cmd += ["-ss", f"{in_ts:.3f}", "-t", f"{duration_s:.3f}", "-i", input_path]
 
         if use_h265:
-            # re-encode H.265
             if use_cuda:
                 cmd += ["-c:v", "hevc_nvenc", "-preset", "medium", "-c:a", "copy"]
             else:
@@ -639,48 +862,139 @@ class VideoCutter(QtWidgets.QMainWindow):
             cmd += ["-c", "copy"]
 
         cmd += [out_path]
+        return cmd
 
+    def _run_ffmpeg_with_progress(self, cmd: list, total_seconds: float, done_msg: str):
         # Progress
-        self._export_prog = QtWidgets.QProgressDialog("Exporting…", "Cancel", 0, 100, self)
-        self._export_prog.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
-        self._export_prog.setAutoClose(True); self._export_prog.setAutoReset(True)
+        prog = QtWidgets.QProgressDialog("Exporting…", "Cancel", 0, 100, self)
+        prog.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        prog.setAutoClose(True); prog.setAutoReset(True)
 
-        self._export_proc = QtCore.QProcess(self)
-        self._export_proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        proc = QtCore.QProcess(self)
+        proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
 
         time_re = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-        total = max(0.001, (self.slider.out_ms - self.slider.in_ms)/1000.0)
+        total = max(0.001, float(total_seconds))
 
         def on_out():
-            data = bytes(self._export_proc.readAllStandardOutput()).decode('utf-8', 'ignore')
+            data = bytes(proc.readAllStandardOutput()).decode('utf-8', 'ignore')
             for line in data.splitlines():
                 m = time_re.search(line)
                 if m:
                     h, m_, s, ms_ = map(int, m.groups())
                     elapsed = h*3600 + m_*60 + s + (ms_/100.0)
-                    self._export_prog.setValue(int(min(100, max(0, (elapsed/total)*100))))
+                    prog.setValue(int(min(100, max(0, (elapsed/total)*100))))
                     QtWidgets.QApplication.processEvents()
 
         def on_done(_code, _status):
-            if self._export_prog:
-                self._export_prog.setValue(100); self._export_prog.close()
-            self.statusBar().showMessage(f"Saved: {out_path}", 4000)
-            self._export_proc = None
-            self._export_prog = None
+            prog.setValue(100); prog.close()
+            self.statusBar().showMessage(done_msg, 4000)
 
         def on_cancel():
-            if self._export_proc:
-                self._export_proc.kill()
+            proc.kill()
 
-        self._export_proc.readyReadStandardOutput.connect(on_out)
-        self._export_proc.finished.connect(on_done)
-        self._export_prog.canceled.connect(on_cancel)
-        self._export_proc.start(cmd[0], cmd[1:])
-        self._export_prog.show()
+        proc.readyReadStandardOutput.connect(on_out)
+        proc.finished.connect(on_done)
+        prog.canceled.connect(on_cancel)
+        proc.start(cmd[0], cmd[1:])
+        prog.show()
+
+        # zapamiętaj ustawienia checkboxów
+        try:
+            self.settings.setValue("use_nvdec", bool(self.chk_nvdec.isChecked()))
+            self.settings.setValue("use_h265", bool(self.chk_h265.isChecked()))
+            self.settings.setValue("remember_geometry", bool(self.chk_remember_geometry.isChecked()))
+            self.settings.setValue("scale_grid", bool(self.chk_scale_grid.isChecked()))
+            self.settings.sync()
+        except Exception:
+            pass
+
+    # ---- Export single (from marks or from selected row) ----
+    def export_current_or_selected(self):
+        if self._loaded_path is None:
+            return
+
+        # priorytet: wybrany wiersz siatki
+        idx = self._selected_row_index()
+        if idx is not None and 0 <= idx < len(self._segments):
+            seg = self._segments[idx]
+            in_ms, out_ms = seg.start_ms, seg.end_ms
+            base = (seg.title or f"{self._loaded_path.stem}_seg{idx+1}").strip().replace(" ", "_")
+        else:
+            # fallback: aktualne IN/OUT
+            if self.slider.in_ms is None or self.slider.out_ms is None or self.slider.out_ms <= self.slider.in_ms:
+                self.statusBar().showMessage("Set IN/OUT or select a segment.", 2500)
+                return
+            in_ms, out_ms = int(self.slider.in_ms), int(self.slider.out_ms)
+            base = f"{self._loaded_path.stem}_{ms_to_hhmmss_ms(in_ms).replace(':','-').replace('.', '-')}_{ms_to_hhmmss_ms(out_ms).replace(':','-').replace('.', '-')}"
+
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Clip As…", str(self._loaded_path.parent / (base + ".mp4")),
+            "MP4 Video (*.mp4);;All Files (*)"
+        )
+        if not out_path:
+            return
+
+        duration_s = (out_ms - in_ms) / 1000.0
+        cmd = self._ffmpeg_cmd(in_ms/1000.0, duration_s, str(self._loaded_path), out_path)
+        self._run_ffmpeg_with_progress(cmd, duration_s, f"Saved: {out_path}")
+
+    # ---- Export segments (selected/all, with optional scaling) ----
+    def export_segments(self, selected_only: bool):
+        if self._loaded_path is None:
+            return
+        if not self._segments:
+            self.statusBar().showMessage("Grid is empty.", 2500)
+            return
+
+        rows = []
+        if selected_only:
+            idx = self._selected_row_index()
+            if idx is None:
+                self.statusBar().showMessage("Select a segment first.", 2500)
+                return
+            rows = [idx]
+        else:
+            rows = list(range(len(self._segments)))
+
+        # katalog docelowy
+        out_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select output directory", str(self._loaded_path.parent)
+        )
+        if not out_dir:
+            return
+        out_dir = Path(out_dir)
+
+        # przygotuj skalowanie
+        scale = bool(self.chk_scale_grid.isChecked())
+        src_dur = getattr(self, "_grid_source_duration", None)
+        cur_dur = int(self._duration_ms)
+
+        for i in rows:
+            seg = self._segments[i]
+            s_ms, e_ms = seg.start_ms, seg.end_ms
+            if scale and src_dur and src_dur > 0 and cur_dur > 0:
+                # przewalutuj segment z czasu źródłowego na bieżący
+                ratio = cur_dur / float(src_dur)
+                s_ms = int(round(s_ms * ratio))
+                e_ms = int(round(e_ms * ratio))
+                s_ms = clamp(s_ms, 0, max(0, cur_dur-1))
+                e_ms = clamp(e_ms, 0, max(0, cur_dur))
+                if e_ms <= s_ms:
+                    e_ms = min(cur_dur, s_ms + 1)
+
+            duration_s = (e_ms - s_ms) / 1000.0
+            # nazwa pliku
+            base_title = seg.title.strip().replace(" ", "_") if seg.title else f"seg{i+1}"
+            fname = f"{self._loaded_path.stem}_{base_title}_{ms_to_hhmmss_ms(s_ms).replace(':','-').replace('.', '-')}_{ms_to_hhmmss_ms(e_ms).replace(':','-').replace('.', '-')}.mp4"
+            out_path = str(out_dir / fname)
+
+            cmd = self._ffmpeg_cmd(s_ms/1000.0, duration_s, str(self._loaded_path), out_path)
+            self._run_ffmpeg_with_progress(cmd, duration_s, f"Saved: {out_path}")
 
     # ---- Close / cleanup ----
     def closeEvent(self, e: QtGui.QCloseEvent):
-        # Potwierdzenie (zostawiamy)
+        # Potwierdzenie
         if getattr(self, "_confirm_on_close", True):
             res = QtWidgets.QMessageBox.question(
                 self, "Confirm exit", "Do you really want to close the app?",
@@ -695,6 +1009,7 @@ class VideoCutter(QtWidgets.QMainWindow):
             self.settings.setValue("use_nvdec", bool(self.chk_nvdec.isChecked()))
             self.settings.setValue("use_h265", bool(self.chk_h265.isChecked()))
             self.settings.setValue("remember_geometry", bool(self.chk_remember_geometry.isChecked()))
+            self.settings.setValue("scale_grid", bool(self.chk_scale_grid.isChecked()))
             if bool(self.chk_remember_geometry.isChecked()):
                 self.settings.setValue("geometry", self.saveGeometry())
             self.settings.sync()
@@ -754,4 +1069,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
