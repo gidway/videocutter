@@ -2,68 +2,68 @@ Video Cutter - help to quick cut video into small pieces
 
 # 🎬 VideoCutter
 
-Lekka aplikacja GUI (Qt + VLC + FFMPEG) do szybkiego wycinania fragmentów wideo.
-Wspiera akcelerację sprzętową NVIDIA (CUDA) i możliwość eksportu do H.265.
+A lightweight GUI application (Qt + VLC + FFMPEG) for quickly cutting video into smaller clips.
+Supports NVIDIA hardware acceleration (CUDA) and optional export to H.265.
 
 ---
 
-## ✨ Funkcje
+## ✨ Features
 
-- Odtwarzanie i podgląd wideo w oknie (VLC backend).
-- Ustawianie punktów **IN / OUT** i eksport wybranego fragmentu.
-- **Eksport do H.265** (opcjonalny).
-- **Akceleracja NVIDIA CUDA** (opcjonalna).
-- Zapamiętywanie:
-  - ustawień (checkboxy w GUI),
-  - rozmiaru okna (opcjonalnie).
-- Obsługa **klawiatury**:
+- Play and preview videos in a window (VLC backend).
+- Set **IN / OUT** points and export selected fragments.
+- **Export to H.265** (optional).
+- **NVIDIA CUDA acceleration** (optional).
+- Saves:
+  - settings (checkboxes in GUI),
+  - window size (optional).
+- **Keyboard shortcuts**:
   - `Space` – Play/Pause,
-  - `I` – ustaw punkt **IN**,
-  - `O` – ustaw punkt **OUT**,
-  - `E` – eksport fragmentu,
-  - `Ctrl+O` – otwórz plik,
-  - `Ctrl+Q` – zamknij aplikację,
-  - `←` / `→` – przewijanie klatka po klatce.
-- **Web banner** w GUI (ładowany przez QtWebEngine).
+  - `I` – set **IN** point,
+  - `O` – set **OUT** point,
+  - `E` – export fragment,
+  - `Ctrl+O` – open file,
+  - `Ctrl+Q` – quit application,
+  - `←` / `→` – frame-by-frame stepping.
+- **Web banner** inside the GUI (loaded with QtWebEngine).
 
 ---
 
-## 🚀 Instalacja i uruchomienie
+## 🚀 Installation & Run
 
-### 1. Klon repozytorium
+### 1. Clone the repository
 ```bash
-git clone https://github.com/<twoje-repo>/VideoCutter.git
+git clone https://github.com/<your-repo>/VideoCutter.git
 cd VideoCutter
 ```
 
 ---
 
-## Uruchom aplikację
+## Run the application
 
-Do repo jest dołączony skrypt uruchomieniowy w Pythonie, który:
-- tworzy wirtualne środowisko ~/.venvs/videocutter,
-- instaluje wszystkie wymagane pakiety,
-- uruchamia aplikację.
+The repository includes a Python startup script that:
+- creates a virtual environment at ~/.venvs/videocutter,
+- installs all required dependencies,
+- launches the application.
 
 ```bash
-python3 run_videocutter.py /ścieżka/do/pliku.mp4
+python3 run_videocutter.py /path/to/video.mp4
 ```
 
-Możesz też uruchomić bez argumentu, a plik wybierzesz z GUI.
+You can also run it without arguments and choose the file from the GUI.
 
 ---
 
-## 📦 Wymagane pakiety
+## 📦 Required packages
 
-Automatycznie instalowane w wirtualnym środowisku:
+Installed automatically inside the virtual environment:
 - PySide6[webengine]
 - python-vlc
 
-Dodatkowo wymagane są systemowe:
+Additionally, system packages required:
 - ffmpeg
-- VLC (biblioteka libvlc)
+- VLC (libvlc library)
 
-Na Ubuntu / Debian:
+On Ubuntu / Debian:
 
 ```bash
 sudo apt install ffmpeg vlc python3-venv
@@ -71,18 +71,19 @@ sudo apt install ffmpeg vlc python3-venv
 
 ---
 
-## ⚙️ Konfiguracja
-W GUI dostępne są opcje:
-✅ Używaj NVIDIA CUDA (akceleracja GPU przy eksporcie).
-✅ Eksportuj do H.265 (HEVC zamiast H.264).
-✅ Zapamiętaj rozmiar okna (ustawienia przywracane po starcie).
+## ⚙️ Configuration
+
+The GUI provides the following options:
+✅ Use NVIDIA CUDA (GPU acceleration when exporting).
+✅ Export to H.265 (HEVC instead of H.264).
+✅ Remember window size (restores on startup).
 
 ---
 
 ## 📜 Licencja
 
 MIT
-– darmowe użycie, modyfikacja i dystrybucja.
+– free to use, modify and distribute.
 
 ---
 
