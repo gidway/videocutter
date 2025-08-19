@@ -1,0 +1,58 @@
+#!/bin/bash
+# video_cutter
+# install
+#   python3 -m venv ~/.venvs/videocutter
+#   ~/.venvs/videocutter/bin/pip install PySide6 python-vlc
+
+# echo 'alias videocutter="~/.venvs/videocutter/bin/python ~/bin/python/video_cutter.py"' >> ~/.bashrc
+# potem:
+#   source ~/.bashrc
+#   videocutter /ścieżka/do/filmu.mp4
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAIN_VIDCUTTER="${SCRIPT_DIR}/python/video_cutter.py"
+PATH_TO_VIDEO="$1"
+VIRTUAL_ENV=~/.venvs/videocutter/
+APP_RUNNER=${VIRTUAL_ENV}bin/python
+#APP_RUNNER="python3"
+#APP_RUNNER="python"
+DEBUG=0
+
+if [ "$DEBUG" == "1" ] ; then
+    echo "VideoCutter(RUN): ${PATH_TO_VIDEO}"
+fi
+
+if [ ! -f "$MAIN_VIDCUTTER" ] ; then
+    echo "ERROR: we can't find VID-CUTTER-MAIN"
+    echo "$MAIN_VIDCUTTER"
+    exit 1
+fi
+
+if [ ! -z "${PATH_TO_VIDEO}" ] ; then
+    if [ ! -f "$PATH_TO_VIDEO" ] ; then
+        echo "ERROR: we can't find video file"
+        echo "$PATH_TO_VIDEO"
+        exit 1
+    fi
+fi
+
+# export LIBVA_MESSAGING_LEVEL=0
+# export LIBVA_DRIVER_NAME=dummy
+export QTWEBENGINE_DISABLE_SANDBOX=1
+export QT_QPA_PLATFORM=xcb
+
+python3 -m venv ~/venvs/videocutter
+
+function _install_all_modules {
+    pip install "PySide6[webengine]" python-vlc
+}
+
+source ~/venvs/videocutter/bin/activate
+if [ "$DEBUG" == "1" ] ; then
+    _install_all_modules
+else
+    _install_all_modules &>/dev/null
+fi
+# -- python -c "from PySide6.QtWebEngineWidgets import QWebEngineView; print('OK')"
+${APP_RUNNER} "$MAIN_VIDCUTTER" "${PATH_TO_VIDEO}"
+
