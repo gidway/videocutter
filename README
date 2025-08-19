@@ -1,3 +1,5 @@
+Video Cutter - help to quick cut video into small pieces
+
 # 🎬 VideoCutter
 
 Lekka aplikacja GUI (Qt + VLC + FFMPEG) do szybkiego wycinania fragmentów wideo.
