@@ -32,8 +32,8 @@ Supports NVIDIA hardware acceleration (CUDA) and optional export to H.265.
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/<your-repo>/VideoCutter.git
-cd VideoCutter
+git clone https://github.com/gidway/videocutter.git
+cd videocutter
 ```
 
 ---
