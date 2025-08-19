@@ -40,16 +40,25 @@ cd videocutter
 
 ## Run the application
 
+You can also run it without arguments and choose the file from the GUI. Or type path to the video as script argument.
+
+### Linux
+
 The repository includes a Python startup script that:
 - creates a virtual environment at ~/.venvs/videocutter,
 - installs all required dependencies,
 - launches the application.
 
 ```bash
-python3 run_videocutter.py /path/to/video.mp4
+python3 run-videocutter.py /path/to/video.mp4
 ```
 
-You can also run it without arguments and choose the file from the GUI.
+### Windows
+
+Double click `run-videocutter.bat` or from command line:
+```bash
+run-videocutter.bat C:\\path\\to\\the-movie.mp4
+```
 
 ---
 
